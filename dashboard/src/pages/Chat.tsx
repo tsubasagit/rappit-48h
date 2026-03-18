@@ -6,7 +6,7 @@ import ChatMessage, { type Message } from '../components/ChatMessage'
 import ChatInput from '../components/ChatInput'
 import SpecPreview from '../components/SpecPreview'
 
-type ProjectStatus = 'hearing' | 'spec_review' | 'spec_approved' | 'building' | 'delivered'
+type ProjectStatus = 'hearing' | 'spec_review' | 'waiting_setup' | 'spec_approved' | 'building' | 'delivered'
 
 type Project = {
   status: ProjectStatus
@@ -141,6 +141,7 @@ export default function Chat() {
           <span className="text-xs text-gray-400 ml-auto">
             {isHearing && 'ヒアリング中'}
             {isSpecReview && '設計書レビュー'}
+            {project?.status === 'waiting_setup' && 'セットアップ待ち'}
             {project?.status === 'spec_approved' && '承認済み'}
             {project?.status === 'building' && '構築中'}
             {project?.status === 'delivered' && '納品完了'}

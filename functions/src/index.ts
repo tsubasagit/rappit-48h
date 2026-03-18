@@ -92,13 +92,21 @@ export const chat = onRequest({ timeoutSeconds: 120 }, async (req, res) => {
     if (result.hearingComplete) {
       const spec = await generateSpec(convData.messages);
 
-      await db.collection("projects").doc(projectId).update({
+      const projectUpdate: Record<string, unknown> = {
         status: "spec_review",
         specMarkdown: spec,
         revisionCount: 0,
         name: result.projectName || "新規プロジェクト",
         description: result.projectDescription || "",
-      });
+      };
+
+      // 外部サービス要件を保存
+      if (result.requiredExternalServices && result.requiredExternalServices.length > 0) {
+        projectUpdate.requiredExternalServices = result.requiredExternalServices;
+        projectUpdate.setupCompleted = false;
+      }
+
+      await db.collection("projects").doc(projectId).update(projectUpdate);
     }
 
     res.json({ reply: result.reply });
@@ -117,13 +125,35 @@ export const approveSpec = onRequest(async (req, res) => {
   const { projectId } = req.body;
   if (!projectId) { res.status(400).json({ error: "projectId required" }); return; }
 
+  // 外部サービスが必要か確認
+  const projectDoc = await db.collection("projects").doc(projectId).get();
+  const projectData = projectDoc.data();
+  const hasExternalServices = projectData?.requiredExternalServices?.length > 0;
+
   await db.collection("projects").doc(projectId).update({
-    status: "spec_approved",
+    status: hasExternalServices ? "waiting_setup" : "spec_approved",
     approvedAt: Date.now(),
   });
 
   // TODO: Slack通知
   // await notifySlack(`新規プロジェクト承認: ${projectId}`)
+
+  res.json({ success: true, needsSetup: hasExternalServices });
+});
+
+// セットアップ完了報告（顧客が外部サービスの準備完了を報告）
+export const completeSetup = onRequest(async (req, res) => {
+  setCors(res);
+  if (req.method === "OPTIONS") { res.status(204).send(""); return; }
+
+  const { projectId } = req.body;
+  if (!projectId) { res.status(400).json({ error: "projectId required" }); return; }
+
+  await db.collection("projects").doc(projectId).update({
+    status: "spec_approved",
+    setupCompleted: true,
+    setupCompletedAt: Date.now(),
+  });
 
   res.json({ success: true });
 });

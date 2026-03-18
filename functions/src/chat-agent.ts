@@ -3,12 +3,21 @@ import Anthropic from "@anthropic-ai/sdk";
 type Message = { role: "user" | "assistant"; content: string };
 type Phase = "basic" | "detail" | "tech";
 
+type ExternalService = {
+  name: string;
+  reason: string;
+  setupUrl: string;
+  requiredKeys: string[];
+  customerAction: string;
+};
+
 type ChatResult = {
   reply: string;
   nextPhase?: Phase;
   hearingComplete: boolean;
   projectName?: string;
   projectDescription?: string;
+  requiredExternalServices?: ExternalService[];
 };
 
 const SYSTEM_PROMPT = `あなたは「ラピットくん」です。AppTalentHub株式会社のAI開発エージェントで、顧客の開発要望をヒアリングする役割を担っています。
@@ -40,11 +49,39 @@ const SYSTEM_PROMPT = `あなたは「ラピットくん」です。AppTalentHub
 - データとして何を管理するか
 - 優先度（48時間で収まる範囲に絞る）
 
-### Phase 3: 技術・デザイン（2-3ターン）
+### Phase 3: 技術・デザイン・外部サービス（2-3ターン）
 聞くべきこと:
 - デザインの方向性（シンプル/ポップ/ビジネス等）
 - 参考にしたいサイトやアプリ（あれば）
 - 特別な技術要件（外部API連携等）
+
+## 外部サービス検出ルール
+
+機能要件から、顧客側でアカウント作成が必要な外部サービスを検出してください。
+以下は代表的なパターンです:
+
+| 機能 | 必要なサービス | 顧客に必要なアクション |
+|---|---|---|
+| 決済・課金 | Stripe | Stripeアカウント作成 + APIキー取得 |
+| メール送信 | SendGrid / Resend | アカウント作成 + APIキー取得 |
+| SMS送信 | Twilio | アカウント作成 + 電話番号購入 |
+| 地図表示 | Google Maps API | Google Cloud Console でAPIキー取得 |
+| AI機能（顧客独自） | OpenAI / Claude API | アカウント作成 + APIキー取得 |
+| 独自ドメイン | ドメインレジストラ | ドメイン購入 + DNS設定 |
+| OAuth認証（Google等） | Google Cloud Console | OAuth同意画面設定 + クライアントID取得 |
+| プッシュ通知 | Firebase (顧客名義) | Firebaseプロジェクト作成 |
+| ファイルストレージ（大容量） | AWS S3 / Cloudflare R2 | アカウント作成 + バケット設定 |
+
+### AppTalentHub側で用意するもの（顧客に案内不要）
+- Firebase Hosting / Firestore（ATH名義で作成）
+- GitHub リポジトリ（ATH org で公開）
+- 基本的なClaude API利用（ヒアリング・設計書生成用）
+
+### ヒアリング中の対応
+1. Phase 2（機能詳細）で外部サービスが必要と判断したら、その場で顧客にやんわり伝える
+   - 例:「決済機能には Stripe というサービスのアカウントが必要になります。もしまだお持ちでなければ、設計書の中にセットアップ手順を記載しますね！」
+2. 無料で始められるか、有料かも伝える
+3. アカウント作成が難しそうな場合は、その機能をPhase 2（将来実装）に回すことも提案する
 
 ## 重要なルール
 1. 一度に質問は最大2つまで。質問攻めにしない
@@ -62,9 +99,19 @@ const SYSTEM_PROMPT = `あなたは「ラピットくん」です。AppTalentHub
   "hearingComplete": true,
   "projectName": "プロジェクト名",
   "projectDescription": "一言説明",
-  "currentPhase": "tech"
+  "currentPhase": "tech",
+  "requiredExternalServices": [
+    {
+      "name": "サービス名（例: Stripe）",
+      "reason": "なぜ必要か（例: 決済機能の実装に必要）",
+      "setupUrl": "公式サイトURL",
+      "requiredKeys": ["必要なキー名（例: STRIPE_SECRET_KEY）"],
+      "customerAction": "顧客がやるべきこと（例: アカウント作成後、ダッシュボードからAPIキーを取得）"
+    }
+  ]
 }
-\`\`\``;
+\`\`\`
+requiredExternalServices は外部サービスが不要な場合は空配列 [] にしてください。`;
 
 const PHASE_THRESHOLDS: Record<Phase, { minTurns: number; nextPhase: Phase | null }> = {
   basic: { minTurns: 3, nextPhase: "detail" },
@@ -131,6 +178,7 @@ export async function handleChat(
   let hearingComplete = false;
   let projectName: string | undefined;
   let projectDescription: string | undefined;
+  let requiredExternalServices: ExternalService[] | undefined;
   let nextPhase: Phase | undefined;
 
   if (jsonMatch) {
@@ -139,6 +187,9 @@ export async function handleChat(
       hearingComplete = parsed.hearingComplete === true;
       projectName = parsed.projectName;
       projectDescription = parsed.projectDescription;
+      if (Array.isArray(parsed.requiredExternalServices) && parsed.requiredExternalServices.length > 0) {
+        requiredExternalServices = parsed.requiredExternalServices;
+      }
     } catch {
       // JSONパースエラーは無視
     }
@@ -161,5 +212,6 @@ export async function handleChat(
     hearingComplete,
     projectName,
     projectDescription,
+    requiredExternalServices,
   };
 }

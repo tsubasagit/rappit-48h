@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { collection, onSnapshot, query, orderBy } from 'firebase/firestore'
 import { Link } from 'react-router-dom'
 import { db } from '../lib/firebase'
-import { Clock, CheckCircle, Hammer, MessageCircle, FileText } from 'lucide-react'
+import { Clock, CheckCircle, Hammer, MessageCircle, FileText, Settings } from 'lucide-react'
 
 type ProjectItem = {
   id: string
@@ -16,6 +16,7 @@ type ProjectItem = {
 const STATUS_BADGE: Record<string, { label: string; color: string; icon: React.ReactNode }> = {
   hearing: { label: 'ヒアリング中', color: 'bg-blue-100 text-blue-700', icon: <MessageCircle className="w-3 h-3" /> },
   spec_review: { label: '設計書レビュー', color: 'bg-yellow-100 text-yellow-700', icon: <FileText className="w-3 h-3" /> },
+  waiting_setup: { label: 'セットアップ待ち', color: 'bg-amber-100 text-amber-700', icon: <Settings className="w-3 h-3" /> },
   spec_approved: { label: '構築待ち', color: 'bg-orange-100 text-orange-700', icon: <Clock className="w-3 h-3" /> },
   building: { label: '構築中', color: 'bg-purple-100 text-purple-700', icon: <Hammer className="w-3 h-3" /> },
   delivered: { label: '納品完了', color: 'bg-green-100 text-green-700', icon: <CheckCircle className="w-3 h-3" /> },
