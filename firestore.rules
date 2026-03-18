@@ -1,0 +1,20 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // プロジェクト: トークンベースの読み取り（認証不要）
+    match /projects/{projectId} {
+      allow read: if true;
+      allow write: if false; // Cloud Functions からのみ書き込み
+    }
+
+    // 会話履歴: Cloud Functions からのみアクセス
+    match /conversations/{conversationId} {
+      allow read, write: if false;
+    }
+
+    // 管理者用（将来的に認証追加）
+    match /admin/{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
