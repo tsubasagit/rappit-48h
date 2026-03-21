@@ -1,142 +1,102 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { HearingData } from "./types";
 
-type Message = { role: "user" | "assistant"; content: string };
+const SPEC_TEMPLATE_PROMPT = `あなたはプロのプロダクトマネージャーです。
+ヒアリングで収集したデータを元に、SERVICE_SPEC.md（サービス仕様書）を生成してください。
 
-const SPEC_SYSTEM_PROMPT = `あなたはソフトウェア設計書を生成する専門家です。ヒアリングの会話履歴を読み、SERVICE_SPEC.md 形式の設計書を生成してください。
-
-## 出力形式
-
-以下のテンプレートに沿って Markdown で出力してください。過不足なく、48時間で構築可能な現実的な範囲に絞ってください。
+## 出力フォーマット
+以下のMarkdown形式で出力してください。各セクションを充実させ、実際の開発で使える品質にしてください。
 
 \`\`\`markdown
-# {サービス名} - サービス仕様書
+# {プロジェクトタイトル} - サービス仕様書
 
 ## 1. サービス概要
-- **一言で**: （1行の説明）
-- **対象ユーザー**: （誰が使うか）
-- **解決する課題**: （何を解決するか）
-- **ステータス**: MVP
+### 1.1 サービス名
+### 1.2 コンセプト
+### 1.3 解決する課題
+### 1.4 ターゲットユーザー
+### 1.5 提供価値
 
 ## 2. ユーザーロールと権限
-| ロール | できること |
-|---|---|
-| ... | ... |
+| ロール | 説明 | 主な権限 |
+|---|---|---|
 
 ## 3. 機能一覧
-### MVP（48時間で実装）
-- [ ] 機能名 — 説明
-- [ ] ...
-
-### Phase 2以降（将来実装）
-- [ ] 機能名 — 説明
+### 3.1 Must（必須機能）
+### 3.2 Should（推奨機能）
+### 3.3 Nice to Have（あれば嬉しい機能）
 
 ## 4. 画面一覧
-| 画面 | パス | 対象ロール | 概要 |
+| # | 画面名 | 概要 | 主要機能 |
 |---|---|---|---|
-| ... | ... | ... | ... |
 
 ## 5. データモデル
-### \`collection_name\`
-- 説明
-- 主要フィールド: field1(型), field2(型)
+### 5.1 主要エンティティ
+### 5.2 ER図（概要）
 
 ## 6. 外部連携
-- **認証**: （方式）
-- **DB**: Firestore
-- **ホスティング**: Firebase Hosting
-- **その他API**: （必要なもの）
+| サービス | 用途 | 必須/任意 |
+|---|---|---|
 
-## 7. 外部サービス要件（セットアップ手順）
+## 7. ビジネスルール
+-
 
-顧客側でアカウント作成・設定が必要なサービスを記載してください。
-不要な場合は「外部サービスの準備は不要です」と記載。
+## 8. 非機能要件
+### 8.1 パフォーマンス
+### 8.2 セキュリティ
+### 8.3 可用性
 
-各サービスについて以下の形式で記載:
+## 9. 既知の課題・制限
+-
 
-### {サービス名}（例: Stripe）
-- **用途**: なぜ必要か
-- **公式サイト**: URL
-- **必要なキー/情報**: 環境変数名（例: STRIPE_SECRET_KEY）
-- **セットアップ手順**:
-  1. ステップ1
-  2. ステップ2
-  3. ...
-- **費用**: 無料枠の有無、概算コスト
-- **注意事項**: テスト環境と本番環境の違い等
-
-### AppTalentHub側で用意するもの（顧客の準備不要）
-- Firebase Hosting / Firestore
-- GitHub リポジトリ
-- デプロイ環境
-
-## 8. ビジネスルール
-- ルール1
-- ルール2
-
-## 9. 非機能要件
-- **想定ユーザー数**: （初期）
-- **パフォーマンス**: （目標）
-- **セキュリティ**: （方針）
-
-## 10. 技術スタック
-- Frontend: React + Vite + TypeScript + Tailwind CSS
-- Backend: Firebase Cloud Functions
-- DB: Firestore
-- Hosting: Firebase Hosting
-- その他: （追加があれば）
-
-## 11. デザイン方針
-- テーマ: （方向性）
-- カラー: （メインカラー）
-- レスポンシブ対応: Yes
+## 10. 更新履歴
+| 日付 | バージョン | 変更内容 |
+|---|---|---|
 \`\`\`
 
-## 重要なルール
-1. Markdownのみ出力（コードブロックで囲まない）
-2. 48時間で実現可能な範囲に必ず絞る（大きすぎる機能は Phase 2 に回す）
-3. 技術スタックは React + Vite + Firebase をベースにする
-4. 日本語で記述する
-5. 具体的で実装者がすぐ着手できる粒度にする`;
+## ルール
+- Markdown形式のみで出力してください（JSON不要）
+- コードブロックのラッパー(\`\`\`markdown ... \`\`\`)は含めず、Markdownテキストそのものを出力してください
+- 各セクションは具体的に記述してください
+- ヒアリングデータに含まれない情報は、合理的に推測して補完してください
+- 日本語で出力してください`;
 
-export async function generateSpec(messages: Message[]): Promise<string> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+export async function generateServiceSpec(
+  apiKey: string,
+  hearingData: HearingData,
+  projectTitle: string
+): Promise<string> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-  // Mock mode
-  if (!apiKey) {
-    return `# サンプルプロジェクト - サービス仕様書
+  const hearingDataSummary = `
+## プロジェクトタイトル
+${projectTitle}
 
-## 1. サービス概要
-- **一言で**: デモ用のサンプル設計書です
-- **対象ユーザー**: テストユーザー
-- **解決する課題**: デモ表示の確認
-- **ステータス**: MVP
+## ヒアリングデータ
+- 課題・概要: ${hearingData.problemStatement ?? "未定義"}
+- ターゲットユーザー: ${hearingData.targetUsers ?? "未定義"}
+- ユーザーロール: ${hearingData.userRoles?.join(", ") ?? "未定義"}
+- 必須機能: ${hearingData.features?.must?.join(", ") ?? "未定義"}
+- 推奨機能: ${hearingData.features?.should?.join(", ") ?? "未定義"}
+- あれば嬉しい機能: ${hearingData.features?.nice?.join(", ") ?? "未定義"}
+- デザイン要望: ${hearingData.designPreferences ?? "未定義"}
+- 技術制約: ${hearingData.techConstraints ?? "未定義"}
+- プラットフォーム: ${hearingData.platformTargets?.join(", ") ?? "未定義"}
+`;
 
-（※ ANTHROPIC_API_KEY が未設定のため、実際の設計書は生成されていません）`;
+  const result = await model.generateContent([
+    SPEC_TEMPLATE_PROMPT,
+    hearingDataSummary,
+  ]);
+
+  let specMd = result.response.text();
+
+  // Remove markdown code block wrapper if Gemini wrapped it
+  const codeBlockMatch = specMd.match(/```(?:markdown)?\s*([\s\S]*?)```/);
+  if (codeBlockMatch && codeBlockMatch[1].includes("# ")) {
+    specMd = codeBlockMatch[1].trim();
   }
 
-  const client = new Anthropic({ apiKey });
-
-  // 会話履歴をコンテキストとしてまとめる
-  const conversationText = messages
-    .map((m) => `${m.role === "user" ? "顧客" : "ラピットくん"}: ${m.content}`)
-    .join("\n\n");
-
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 4096,
-    system: SPEC_SYSTEM_PROMPT,
-    messages: [
-      {
-        role: "user",
-        content: `以下のヒアリング内容から SERVICE_SPEC.md を生成してください。\n\n---\n\n${conversationText}`,
-      },
-    ],
-  });
-
-  const specText = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("");
-
-  return specText;
+  return specMd;
 }

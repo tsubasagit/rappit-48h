@@ -1,176 +1,407 @@
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
-import { onRequest } from "firebase-functions/v2/https";
-import { setGlobalOptions } from "firebase-functions/v2";
-import { handleChat } from "./chat-agent";
-import { generateSpec } from "./spec-generator";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { onCall, HttpsError } from "firebase-functions/v2/https";
+import { GEMINI_API_KEY } from "./config";
+import { processChat } from "./gemini-agent";
+import { generateServiceSpec } from "./spec-generator";
+import { generateMockupHtml } from "./mockup-generator";
+import {
+  ConversationTurn,
+  HearingData,
+  HearingPhase,
+} from "./types";
 
 initializeApp();
 const db = getFirestore();
 
-setGlobalOptions({ region: "asia-northeast1" });
+const REGION = "asia-northeast1";
 
-// CORS ヘルパー
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function setCors(res: any) {
-  res.set("Access-Control-Allow-Origin", "*");
-  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type");
+const PHASE_ORDER: HearingPhase[] = [
+  "problem",
+  "users",
+  "features",
+  "design",
+  "tech",
+  "confirm",
+  "build_together",
+  "next_steps",
+];
+
+function getNextPhase(currentPhase: HearingPhase): HearingPhase | null {
+  const currentIndex = PHASE_ORDER.indexOf(currentPhase);
+  if (currentIndex < 0 || currentIndex >= PHASE_ORDER.length - 1) {
+    return null;
+  }
+  return PHASE_ORDER[currentIndex + 1];
 }
 
-// プロジェクト作成
-export const createProject = onRequest(async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") { res.status(204).send(""); return; }
+function applyExtractedData(
+  hearingData: HearingData,
+  extractedData: { field: string; value: unknown }[]
+): HearingData {
+  const updated = { ...hearingData };
+  for (const { field, value } of extractedData) {
+    switch (field) {
+      case "problemStatement":
+        updated.problemStatement = String(value);
+        break;
+      case "targetUsers":
+        updated.targetUsers = String(value);
+        break;
+      case "userRoles":
+        if (Array.isArray(value)) {
+          updated.userRoles = [
+            ...(updated.userRoles ?? []),
+            ...value.map(String),
+          ];
+        }
+        break;
+      case "features":
+        if (typeof value === "object" && value !== null) {
+          const featVal = value as Record<string, unknown>;
+          updated.features = {
+            must: [
+              ...(updated.features?.must ?? []),
+              ...(Array.isArray(featVal.must)
+                ? featVal.must.map(String)
+                : []),
+            ],
+            should: [
+              ...(updated.features?.should ?? []),
+              ...(Array.isArray(featVal.should)
+                ? featVal.should.map(String)
+                : []),
+            ],
+            nice: [
+              ...(updated.features?.nice ?? []),
+              ...(Array.isArray(featVal.nice)
+                ? featVal.nice.map(String)
+                : []),
+            ],
+          };
+        }
+        break;
+      case "designPreferences":
+        updated.designPreferences = String(value);
+        break;
+      case "techConstraints":
+        updated.techConstraints = String(value);
+        break;
+      case "platformTargets":
+        if (Array.isArray(value)) {
+          updated.platformTargets = [
+            ...(updated.platformTargets ?? []),
+            ...value.map(String),
+          ];
+        }
+        break;
+    }
+  }
+  return updated;
+}
 
-  const projectRef = db.collection("projects").doc();
-  await projectRef.set({
-    status: "hearing",
-    createdAt: Date.now(),
-    source: req.body.source || "lp",
-  });
+/**
+ * rabit48Chat
+ * Handles a single chat turn in the hearing process.
+ */
+export const rabit48Chat = onCall(
+  { region: REGION, secrets: [GEMINI_API_KEY] },
+  async (request) => {
+    const { projectId, message } = request.data as {
+      projectId: string;
+      message: string;
+    };
 
-  // 会話ドキュメントも初期化
-  await db.collection("conversations").doc(projectRef.id).set({
-    messages: [],
-    phase: "basic", // basic → detail → tech
-    turnCount: 0,
-  });
-
-  res.json({ projectId: projectRef.id });
-});
-
-// メッセージ取得
-export const getMessages = onRequest(async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") { res.status(204).send(""); return; }
-
-  const projectId = req.query.projectId as string;
-  if (!projectId) { res.status(400).json({ error: "projectId required" }); return; }
-
-  const convDoc = await db.collection("conversations").doc(projectId).get();
-  if (!convDoc.exists) { res.json({ messages: [] }); return; }
-
-  res.json({ messages: convDoc.data()?.messages || [] });
-});
-
-// チャット（ヒアリング）
-export const chat = onRequest({ timeoutSeconds: 120 }, async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") { res.status(204).send(""); return; }
-
-  const { projectId, message, isInitial } = req.body;
-  if (!projectId) { res.status(400).json({ error: "projectId required" }); return; }
-
-  try {
-    const convRef = db.collection("conversations").doc(projectId);
-    const convDoc = await convRef.get();
-    const convData = convDoc.data() || { messages: [], phase: "basic", turnCount: 0 };
-
-    // ユーザーメッセージを追加（初回挨拶以外）
-    if (!isInitial && message) {
-      convData.messages.push({ role: "user", content: message });
-      convData.turnCount++;
+    if (!projectId || !message) {
+      throw new HttpsError(
+        "invalid-argument",
+        "projectId and message are required."
+      );
     }
 
-    // Claude API でラピットくんの応答を生成
-    const result = await handleChat(convData.messages, convData.phase, convData.turnCount, isInitial);
+    const apiKey = GEMINI_API_KEY.value();
 
-    // アシスタントメッセージを追加
-    convData.messages.push({ role: "assistant", content: result.reply });
+    // Load project
+    const projectRef = db.collection("projects").doc(projectId);
+    const projectSnap = await projectRef.get();
 
-    // フェーズ更新
-    const updatedPhase = result.nextPhase || convData.phase;
+    if (!projectSnap.exists) {
+      throw new HttpsError("not-found", "Project not found.");
+    }
 
-    await convRef.set({
-      messages: convData.messages,
-      phase: updatedPhase,
-      turnCount: convData.turnCount,
+    const projectData = projectSnap.data()!;
+    const currentPhase: HearingPhase = projectData.currentPhase ?? "problem";
+    const hearingData: HearingData = projectData.hearingData ?? {};
+
+    // Load conversation history
+    const messagesSnap = await projectRef
+      .collection("messages")
+      .orderBy("createdAt", "asc")
+      .get();
+
+    const conversationHistory: ConversationTurn[] = messagesSnap.docs.map(
+      (doc) => {
+        const data = doc.data();
+        return {
+          role: data.role === "user" ? "user" : "model",
+          parts: [{ text: data.text }],
+        };
+      }
+    );
+
+    // Add the new user message to history
+    conversationHistory.push({
+      role: "user",
+      parts: [{ text: message }],
     });
 
-    // ヒアリング完了 → 設計書生成
-    if (result.hearingComplete) {
-      const spec = await generateSpec(convData.messages);
+    // Save user message to Firestore
+    await projectRef.collection("messages").add({
+      role: "user",
+      text: message,
+      createdAt: FieldValue.serverTimestamp(),
+    });
 
-      const projectUpdate: Record<string, unknown> = {
-        status: "spec_review",
-        specMarkdown: spec,
-        revisionCount: 0,
-        name: result.projectName || "新規プロジェクト",
-        description: result.projectDescription || "",
-      };
+    // Call Gemini agent
+    const agentResponse = await processChat(
+      apiKey,
+      conversationHistory,
+      currentPhase,
+      hearingData
+    );
 
-      // 外部サービス要件を保存
-      if (result.requiredExternalServices && result.requiredExternalServices.length > 0) {
-        projectUpdate.requiredExternalServices = result.requiredExternalServices;
-        projectUpdate.setupCompleted = false;
+    // Apply extracted data
+    const updatedHearingData = applyExtractedData(
+      hearingData,
+      agentResponse.extractedData
+    );
+
+    // Determine next phase
+    let nextPhase = currentPhase;
+    if (agentResponse.phaseComplete) {
+      const next = getNextPhase(currentPhase);
+      if (next) {
+        nextPhase = next;
       }
-
-      await db.collection("projects").doc(projectId).update(projectUpdate);
     }
 
-    res.json({ reply: result.reply });
-  } catch (error) {
-    const errMsg = error instanceof Error ? error.message : "Unknown error";
-    console.error("Chat error:", errMsg);
-    res.status(500).json({ error: "チャット処理でエラーが発生しました" });
+    // Save agent response message
+    await projectRef.collection("messages").add({
+      role: "assistant",
+      text: agentResponse.reply,
+      phase: currentPhase,
+      phaseComplete: agentResponse.phaseComplete,
+      extractedData: agentResponse.extractedData,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    // Update project
+    const updatePayload: Record<string, unknown> = {
+      hearingData: updatedHearingData,
+      currentPhase: nextPhase,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    // If next_steps phase is complete, mark session as finished
+    if (currentPhase === "next_steps" && agentResponse.phaseComplete) {
+      updatePayload.status = "hearing_complete";
+    }
+
+    await projectRef.update(updatePayload);
+
+    return {
+      reply: agentResponse.reply,
+      currentPhase: nextPhase,
+      phaseComplete: agentResponse.phaseComplete,
+      extractedData: agentResponse.extractedData,
+      hearingComplete:
+        currentPhase === "next_steps" && agentResponse.phaseComplete,
+    };
   }
-});
+);
 
-// 設計書承認
-export const approveSpec = onRequest(async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") { res.status(204).send(""); return; }
+/**
+ * rabit48GenerateSpec
+ * Generates SERVICE_SPEC.md from the collected hearing data.
+ */
+export const rabit48GenerateSpec = onCall(
+  { region: REGION, secrets: [GEMINI_API_KEY] },
+  async (request) => {
+    const { projectId } = request.data as { projectId: string };
 
-  const { projectId } = req.body;
-  if (!projectId) { res.status(400).json({ error: "projectId required" }); return; }
+    if (!projectId) {
+      throw new HttpsError("invalid-argument", "projectId is required.");
+    }
 
-  // 外部サービスが必要か確認
-  const projectDoc = await db.collection("projects").doc(projectId).get();
-  const projectData = projectDoc.data();
-  const hasExternalServices = projectData?.requiredExternalServices?.length > 0;
+    const apiKey = GEMINI_API_KEY.value();
 
-  await db.collection("projects").doc(projectId).update({
-    status: hasExternalServices ? "waiting_setup" : "spec_approved",
-    approvedAt: Date.now(),
-  });
+    const projectRef = db.collection("projects").doc(projectId);
+    const projectSnap = await projectRef.get();
 
-  // TODO: Slack通知
-  // await notifySlack(`新規プロジェクト承認: ${projectId}`)
+    if (!projectSnap.exists) {
+      throw new HttpsError("not-found", "Project not found.");
+    }
 
-  res.json({ success: true, needsSetup: hasExternalServices });
-});
+    const projectData = projectSnap.data()!;
+    const hearingData: HearingData = projectData.hearingData ?? {};
+    const projectTitle: string = projectData.title ?? "Untitled Project";
 
-// セットアップ完了報告（顧客が外部サービスの準備完了を報告）
-export const completeSetup = onRequest(async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") { res.status(204).send(""); return; }
+    // Generate spec
+    const specMd = await generateServiceSpec(apiKey, hearingData, projectTitle);
 
-  const { projectId } = req.body;
-  if (!projectId) { res.status(400).json({ error: "projectId required" }); return; }
+    // Save to project
+    await projectRef.update({
+      serviceSpecMd: specMd,
+      status: "reviewing",
+      updatedAt: FieldValue.serverTimestamp(),
+    });
 
-  await db.collection("projects").doc(projectId).update({
-    status: "spec_approved",
-    setupCompleted: true,
-    setupCompletedAt: Date.now(),
-  });
+    return {
+      serviceSpecMd: specMd,
+      status: "reviewing",
+    };
+  }
+);
 
-  res.json({ success: true });
-});
+/**
+ * rabit48GenerateMockups
+ * Generates HTML mockup pages based on the spec and hearing data.
+ */
+export const rabit48GenerateMockups = onCall(
+  { region: REGION, secrets: [GEMINI_API_KEY], timeoutSeconds: 300 },
+  async (request) => {
+    const { projectId } = request.data as { projectId: string };
 
-// ステータス更新（管理者用）
-export const updateStatus = onRequest(async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") { res.status(204).send(""); return; }
+    if (!projectId) {
+      throw new HttpsError("invalid-argument", "projectId is required.");
+    }
 
-  const { projectId, status, githubUrl, deployUrl } = req.body;
-  if (!projectId || !status) { res.status(400).json({ error: "projectId and status required" }); return; }
+    const apiKey = GEMINI_API_KEY.value();
 
-  const update: Record<string, unknown> = { status };
-  if (githubUrl) update.githubUrl = githubUrl;
-  if (deployUrl) update.deployUrl = deployUrl;
-  if (status === "delivered") update.deliveredAt = Date.now();
+    const projectRef = db.collection("projects").doc(projectId);
+    const projectSnap = await projectRef.get();
 
-  await db.collection("projects").doc(projectId).update(update);
-  res.json({ success: true });
-});
+    if (!projectSnap.exists) {
+      throw new HttpsError("not-found", "Project not found.");
+    }
+
+    const projectData = projectSnap.data()!;
+    const hearingData: HearingData = projectData.hearingData ?? {};
+    const specMd: string = projectData.serviceSpecMd ?? "";
+
+    if (!specMd) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Service spec must be generated before mockups."
+      );
+    }
+
+    // Generate mockups
+    const htmlPages = await generateMockupHtml(apiKey, specMd, hearingData);
+
+    // Save mockup data to project
+    const mockups = htmlPages.map((html, index) => ({
+      index,
+      html,
+      createdAt: new Date().toISOString(),
+    }));
+
+    await projectRef.update({
+      mockups,
+      status: "mockups_generated",
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    return {
+      mockupCount: htmlPages.length,
+      status: "mockups_generated",
+    };
+  }
+);
+
+/**
+ * rabit48RegenerateSpec
+ * Regenerates SERVICE_SPEC.md with user feedback incorporated.
+ */
+export const rabit48RegenerateSpec = onCall(
+  { region: REGION, secrets: [GEMINI_API_KEY] },
+  async (request) => {
+    const { projectId, feedback } = request.data as {
+      projectId: string;
+      feedback: string;
+    };
+
+    if (!projectId || !feedback) {
+      throw new HttpsError(
+        "invalid-argument",
+        "projectId and feedback are required."
+      );
+    }
+
+    const apiKey = GEMINI_API_KEY.value();
+
+    const projectRef = db.collection("projects").doc(projectId);
+    const projectSnap = await projectRef.get();
+
+    if (!projectSnap.exists) {
+      throw new HttpsError("not-found", "Project not found.");
+    }
+
+    const projectData = projectSnap.data()!;
+    const hearingData: HearingData = projectData.hearingData ?? {};
+    const projectTitle: string = projectData.title ?? "Untitled Project";
+    const previousSpec: string = projectData.serviceSpecMd ?? "";
+
+    // Generate updated spec using Gemini with feedback context
+    const genAI = await import("@google/generative-ai");
+    const ai = new genAI.GoogleGenerativeAI(apiKey);
+    const model = ai.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+    const prompt = `あなたはプロのプロダクトマネージャーです。
+以下のサービス仕様書に対してユーザーからフィードバックを受けました。
+フィードバックを反映して仕様書を改善してください。
+
+## 現在の仕様書
+${previousSpec}
+
+## ユーザーからのフィードバック
+${feedback}
+
+## ヒアリングデータ
+${JSON.stringify(hearingData, null, 2)}
+
+## プロジェクトタイトル
+${projectTitle}
+
+## ルール
+- 既存の仕様書のフォーマットを維持してください
+- フィードバックを適切に反映してください
+- Markdownテキストのみを出力してください（コードブロックのラッパー不要）
+- 日本語で出力してください`;
+
+    const result = await model.generateContent(prompt);
+    let specMd = result.response.text();
+
+    // Remove markdown code block wrapper if present
+    const codeBlockMatch = specMd.match(/```(?:markdown)?\s*([\s\S]*?)```/);
+    if (codeBlockMatch && codeBlockMatch[1].includes("# ")) {
+      specMd = codeBlockMatch[1].trim();
+    }
+
+    // Save updated spec
+    await projectRef.update({
+      serviceSpecMd: specMd,
+      specRevisionHistory: FieldValue.arrayUnion({
+        feedback,
+        regeneratedAt: new Date().toISOString(),
+      }),
+      status: "reviewing",
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    return {
+      serviceSpecMd: specMd,
+      status: "reviewing",
+    };
+  }
+);
