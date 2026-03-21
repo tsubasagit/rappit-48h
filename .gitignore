@@ -1,0 +1,8 @@
+node_modules/
+dist/
+functions/lib/
+.env
+.env.local
+.env.*.local
+*.tsbuildinfo
+.firebase/
